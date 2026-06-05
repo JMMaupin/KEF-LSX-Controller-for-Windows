@@ -386,6 +386,7 @@ class KefApp(ctk.CTk):
         self._tray_icon      = None
         self._active_source  = None
         self._speaker_status = None
+        self._last_poll_time = time.time()
 
         self._hook      = None
         self._hook_proc = None
@@ -792,7 +793,34 @@ class KefApp(ctk.CTk):
                     self._show_main_window()
         except Exception:
             pass
+        self._check_wake()
         self.after(200, self._drain_queue)
+
+    # =========================================================================
+    # Wake detection
+    # =========================================================================
+
+    def _check_wake(self):
+        """Detect PC wake from sleep and refresh speaker state."""
+        now = time.time()
+        gap = now - self._last_poll_time
+        self._last_poll_time = now
+        # If gap > 5 seconds (normal poll is 1s), PC probably woke from sleep
+        if gap > 5 and self._connected and self.speaker:
+            try:
+                self._executor.submit(self._bg_refresh_state)
+                self.after(2000, self._force_ui_sync)
+                if self._auto_start_usb_var.get():
+                    self.after(3500, lambda: self._cmd_set_source("usb"))
+            except Exception:
+                pass
+
+    def _force_ui_sync(self):
+        """Force synchronization between tray icon and UI state."""
+        if self._active_source and self._speaker_status == PWR_ON:
+            self._update_tray_icon(self._active_source)
+        elif self._speaker_status == PWR_STANDBY:
+            self._update_tray_icon(None)
 
     # =========================================================================
     # Connection
@@ -836,9 +864,12 @@ class KefApp(ctk.CTk):
         self._enable_controls(True)
         self._start_polling()
 
-        # Auto-activate USB on startup if configured
+        # Auto-activate USB on startup if configured and not already active
         if self._is_startup and self._auto_start_usb_var.get():
-            self.after(1500, lambda: self._cmd_set_source("usb"))
+            current_source = info.get("source", "")
+            is_active = info.get("status") == PWR_ON
+            if not (current_source == "usb" and is_active):
+                self.after(1500, lambda: self._cmd_set_source("usb"))
 
     def _disconnect(self):
         self._poll_running = False
