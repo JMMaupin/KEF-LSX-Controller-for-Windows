@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Build environment (see build.cmd)
+.venv-build/
+
 # PyInstaller build artifacts (binaries are published as GitHub Releases, not tracked in git)
 build/
 dist/

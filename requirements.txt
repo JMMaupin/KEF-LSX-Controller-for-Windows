@@ -1,4 +1,5 @@
-pykefcontrol>=0.9.3
-customtkinter>=5.2.0
-Pillow>=10.0.0
-pystray>=0.19.5
+# Exact versions: the executable is built from these (see build.cmd).
+pykefcontrol==0.9.3
+customtkinter==5.2.2
+Pillow==12.3.0
+pystray==0.19.5

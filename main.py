@@ -3,7 +3,6 @@ KEF LSX II Controller
 GUI application built on top of pykefcontrol.
 """
 
-import os
 import sys
 import json
 import time
@@ -11,7 +10,8 @@ import queue
 import threading
 import ctypes
 import ctypes.wintypes
-import winreg
+import logging
+import urllib.parse
 import urllib.request
 import concurrent.futures
 from io import BytesIO
@@ -23,6 +23,10 @@ import pystray
 from PIL import Image, ImageDraw
 
 from pykefcontrol.kef_connector import KefConnector
+
+from kef_controller import __version__, installer, logging_setup, paths, setup_flow
+
+log = logging.getLogger(logging_setup.LOGGER_NAME)
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -217,24 +221,19 @@ def _make_source_btn_image(src, active, size=BTN_SIZE):
 
 POLL_INTERVAL_S = 1    # seconds between poll cycles
 
+# Auto USB (at boot and on wake from sleep): how long to wait for the
+# speaker to answer, the network being often not ready yet.
+AUTO_USB_ATTEMPTS = 20   # reads of the speaker state before giving up
+AUTO_USB_RETRY_S  = 3    # seconds between two reads
+HTTP_TIMEOUT_S    = 4    # pykefcontrol's getters have no timeout at all
+
+# At boot, the network may come up after the application: retry the
+# connection silently for this long before showing an error.
+STARTUP_CONNECT_S = 120
+
 # Store config in %APPDATA%\KefLSXController so it works even when the .exe
 # lives in a write-protected location like C:\Program Files\.
-# Fall back to the .exe / source directory if APPDATA is unavailable.
-def _resolve_config_path():
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        cfg_dir = Path(appdata) / "KefLSXController"
-        try:
-            cfg_dir.mkdir(parents=True, exist_ok=True)
-            return cfg_dir / "config.json"
-        except Exception:
-            pass
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "config.json"
-    return Path(__file__).parent / "config.json"
-
-
-CONFIG_PATH = _resolve_config_path()
+CONFIG_PATH = paths.config_file()
 
 
 def _resource_path(rel):
@@ -279,43 +278,22 @@ class _NOTIFYICONIDENTIFIER(ctypes.Structure):
 
 
 # ---------------------------------------------------------------------------
-# Windows startup registry helpers
+# Speaker power state, read straight from the speaker
 # ---------------------------------------------------------------------------
-_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_STARTUP_REG_NAME = "KEF LSX Controller"
+def _read_power_state(ip):
+    """Fresh (status, source) of the speaker, e.g. ("standby", "standby").
 
+    Read on the speaker itself, never from the UI's mirrors, which may be
+    stale or not filled in yet. Raises on any network or format error.
+    """
+    def get(path, field):
+        query = urllib.parse.urlencode({"path": path, "roles": "value"})
+        url = f"http://{ip}/api/getData?{query}"
+        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_S) as resp:
+            return json.load(resp)[0][field]
 
-def _startup_exe_path():
-    if getattr(sys, "frozen", False):
-        # PyInstaller .exe
-        return f'"{sys.executable}" --startup'
-    else:
-        # Script mode - use absolute path
-        script_path = Path(__file__).resolve()
-        return f'"{sys.executable}" "{script_path}" --startup'
-
-
-def _is_startup_enabled():
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
-                            0, winreg.KEY_READ) as key:
-            val, _ = winreg.QueryValueEx(key, _STARTUP_REG_NAME)
-            return val == _startup_exe_path()
-    except Exception:
-        return False
-
-
-def _set_startup(enabled):
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
-                            0, winreg.KEY_WRITE) as key:
-            if enabled:
-                winreg.SetValueEx(key, _STARTUP_REG_NAME, 0,
-                                  winreg.REG_SZ, _startup_exe_path())
-            else:
-                winreg.DeleteValue(key, _STARTUP_REG_NAME)
-    except Exception:
-        pass
+    return (get("settings:/kef/host/speakerStatus", "kefSpeakerStatus"),
+            get("settings:/kef/play/physicalSource", "kefPhysicalSource"))
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +310,7 @@ def _separator(parent):
 # ---------------------------------------------------------------------------
 class KefApp(ctk.CTk):
 
-    def __init__(self, show_event=None, is_startup=False):
+    def __init__(self, show_event=None, quit_event=None, is_startup=False):
         # DPI-aware BEFORE any window creation, otherwise the mouse hook
         # coordinates won't match what GetWindowRect returns.
         try:
@@ -352,7 +330,7 @@ class KefApp(ctk.CTk):
             pass
 
         super().__init__()
-        self.title("KEF LSX II Controller")
+        self.title(f"KEF LSX II Controller {__version__}")
         self.geometry("700x380")
         self.resizable(False, False)
         try:
@@ -391,9 +369,17 @@ class KefApp(ctk.CTk):
         self._hook      = None
         self._hook_proc = None
 
+        # Only one auto USB check at a time (boot and wake may overlap)
+        self._auto_usb_lock = threading.Lock()
+
         if show_event:
             threading.Thread(
-                target=self._wait_show_event, args=(show_event,),
+                target=self._wait_event, args=(show_event, "show"),
+                daemon=True).start()
+        # Set by the installer before it replaces the executable
+        if quit_event:
+            threading.Thread(
+                target=self._wait_event, args=(quit_event, "quit"),
                 daemon=True).start()
 
         self._build_ui()
@@ -791,6 +777,10 @@ class KefApp(ctk.CTk):
                     self._scroll_volume(data)
                 elif kind == "show":
                     self._show_main_window()
+                elif kind == "quit":
+                    log.info("L'installateur demande la fermeture")
+                    self._quit_app()
+                    return
         except Exception:
             pass
         self._check_wake()
@@ -805,13 +795,15 @@ class KefApp(ctk.CTk):
         now = time.time()
         gap = now - self._last_poll_time
         self._last_poll_time = now
-        # If gap > 5 seconds (normal poll is 1s), PC probably woke from sleep
+        # If gap > 5 seconds (normal poll is 1s), PC probably woke from sleep.
+        # A main loop blocked by a dialog looks the same: whatever follows
+        # must be harmless when it fires for nothing.
         if gap > 5 and self._connected and self.speaker:
             try:
                 self._executor.submit(self._bg_refresh_state)
                 self.after(2000, self._force_ui_sync)
                 if self._auto_start_usb_var.get():
-                    self.after(3500, lambda: self._cmd_set_source("usb"))
+                    self._start_auto_usb("réveil")
             except Exception:
                 pass
 
@@ -833,23 +825,37 @@ class KefApp(ctk.CTk):
                 "Missing IP", "Please enter the speaker IP address.")
             return
         self._conn_btn.configure(state="disabled", text="Connecting...")
-        self._executor.submit(self._bg_connect, ip)
+        # At boot the network may not be up yet: keep trying for a while
+        # instead of greeting the user with an error.
+        patience = STARTUP_CONNECT_S if self._is_startup else 0
+        self._executor.submit(self._bg_connect, ip, patience)
 
-    def _bg_connect(self, ip):
-        try:
-            spk = KefConnector(ip)
-            self.speaker = spk
-            self._save_config()
-            self._ui_q.put(("connected", {
-                "status":   spk.status,
-                "name":     spk.speaker_name,
-                "model":    spk.speaker_model,
-                "firmware": spk.firmware_version,
-            }))
-            self._bg_refresh_state()
-        except Exception as exc:
-            self.speaker = None
-            self._ui_q.put(("error", str(exc)))
+    def _bg_connect(self, ip, patience_s=0):
+        deadline = time.monotonic() + patience_s
+        while True:
+            try:
+                spk = KefConnector(ip)
+                info = {
+                    "status":   spk.status,
+                    "name":     spk.speaker_name,
+                    "model":    spk.speaker_model,
+                    "firmware": spk.firmware_version,
+                }
+                break
+            except Exception as exc:
+                if time.monotonic() < deadline:
+                    log.info("Connexion à %s impossible, nouvel essai : %s", ip, exc)
+                    time.sleep(5)
+                    continue
+                log.warning("Connexion à %s impossible : %s", ip, exc)
+                self.speaker = None
+                self._ui_q.put(("error", str(exc)))
+                return
+        self.speaker = spk
+        self._save_config()
+        log.info("Connecté à %s (%s)", ip, info["status"])
+        self._ui_q.put(("connected", info))
+        self._bg_refresh_state()
 
     def _on_connected(self, info):
         self._connected = True
@@ -864,12 +870,83 @@ class KefApp(ctk.CTk):
         self._enable_controls(True)
         self._start_polling()
 
-        # Auto-activate USB on startup if configured and not already active
-        if self._is_startup and self._auto_start_usb_var.get():
-            current_source = info.get("source", "")
-            is_active = info.get("status") == PWR_ON
-            if not (current_source == "usb" and is_active):
-                self.after(1500, lambda: self._cmd_set_source("usb"))
+        # Auto USB at boot, once per launch (a later reconnect is not a boot)
+        if self._is_startup:
+            self._is_startup = False
+            if self._auto_start_usb_var.get():
+                self._start_auto_usb("démarrage")
+
+    # =========================================================================
+    # Auto USB (boot / wake from sleep)
+    # =========================================================================
+
+    def _start_auto_usb(self, reason):
+        """Main thread: start the auto USB check unless one is running."""
+        if not self._auto_usb_lock.acquire(blocking=False):
+            return
+        ip = self._ip_var.get().strip()
+
+        def _job():
+            try:
+                self._bg_auto_start_usb(ip, reason)
+            except Exception:
+                log.exception("Auto USB (%s) : erreur", reason)
+            finally:
+                self._auto_usb_lock.release()
+        self._executor.submit(_job)
+
+    def _bg_auto_start_usb(self, ip, reason):
+        """Switch the speaker to USB only if it is certainly in standby.
+
+        Never a toggle: a speaker already on -- on USB or on any other
+        source -- is left alone. Any doubt (no answer, unexpected value,
+        status and source disagreeing) means doing nothing: an unwanted
+        shutdown or source change is worse than a missed power-on.
+        """
+        state = None
+        for attempt in range(1, AUTO_USB_ATTEMPTS + 1):
+            try:
+                state = _read_power_state(ip)
+                break
+            except Exception as exc:
+                log.info("Auto USB (%s) : enceinte muette (essai %d/%d) : %s",
+                         reason, attempt, AUTO_USB_ATTEMPTS, exc)
+                time.sleep(AUTO_USB_RETRY_S)
+        if state is None:
+            log.warning("Auto USB (%s) : état inconnu, rien n'est envoyé", reason)
+            return
+
+        status, source = state
+        if status == PWR_ON:
+            log.info("Auto USB (%s) : déjà allumée sur '%s', rien n'est envoyé",
+                     reason, source)
+            return
+        if state != (PWR_STANDBY, PWR_STANDBY):
+            log.warning("Auto USB (%s) : état incohérent %s, rien n'est envoyé",
+                        reason, state)
+            return
+
+        # Second read just before acting: the speaker may have been switched
+        # on in between (remote, KEF app, auto-wake on signal).
+        time.sleep(1)
+        try:
+            state = _read_power_state(ip)
+        except Exception as exc:
+            log.warning("Auto USB (%s) : relecture impossible (%s), rien n'est "
+                        "envoyé", reason, exc)
+            return
+        if state != (PWR_STANDBY, PWR_STANDBY):
+            log.info("Auto USB (%s) : l'état a changé %s, rien n'est envoyé",
+                     reason, state)
+            return
+
+        spk = self.speaker
+        if not spk:
+            log.warning("Auto USB (%s) : déconnecté, rien n'est envoyé", reason)
+            return
+        log.info("Auto USB (%s) : enceinte en veille, passage en USB", reason)
+        spk.source = "usb"
+        self._ui_q.put(("state", {"source": "usb", "speaker_status": PWR_ON}))
 
     def _disconnect(self):
         self._poll_running = False
@@ -1145,7 +1222,7 @@ class KefApp(ctk.CTk):
         # available -> Fatal Python error.
         threading.Thread(target=self._hook_thread_proc, daemon=True).start()
 
-    def _wait_show_event(self, event_handle):
+    def _wait_event(self, event_handle, kind):
         kernel32 = ctypes.windll.kernel32
         kernel32.WaitForSingleObject.argtypes = [
             ctypes.c_void_p, ctypes.wintypes.DWORD]
@@ -1154,7 +1231,7 @@ class KefApp(ctk.CTk):
         WAIT_OBJECT_0 = 0x00000000
         while True:
             if kernel32.WaitForSingleObject(event_handle, INFINITE) == WAIT_OBJECT_0:
-                self._ui_q.put(("show", None))
+                self._ui_q.put((kind, None))
 
     def _hook_thread_proc(self):
         user32  = ctypes.windll.user32
@@ -1283,9 +1360,10 @@ class KefApp(ctk.CTk):
             pystray.MenuItem(
                 "Run with Windows",
                 self._tray_toggle_startup,
-                checked=lambda _: _is_startup_enabled(),
+                checked=lambda _: installer.is_startup_enabled(),
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"Version {__version__}", None, enabled=False),
             pystray.MenuItem("Quit", self._tray_quit),
         )
         self._tray_icon = pystray.Icon(
@@ -1299,7 +1377,7 @@ class KefApp(ctk.CTk):
         self.after(0, self._show_main_window)
 
     def _tray_toggle_startup(self, *_):
-        _set_startup(not _is_startup_enabled())
+        installer.set_startup(not installer.is_startup_enabled())
 
     def _tray_quit(self, _icon, _item):
         self.after(0, self._quit_app)
@@ -1362,23 +1440,42 @@ def _acquire_single_instance():
     return handle
 
 
-def _create_show_event():
-    """Creates the named auto-reset event the first instance listens on."""
+def _create_event(name):
+    """Creates a named auto-reset event the first instance listens on."""
     kernel32 = ctypes.windll.kernel32
     kernel32.CreateEventW.argtypes = [
         ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.BOOL, ctypes.c_wchar_p]
     kernel32.CreateEventW.restype = ctypes.c_void_p
-    return kernel32.CreateEventW(None, False, False, _SINGLE_INSTANCE_EVENT)
+    return kernel32.CreateEventW(None, False, False, name)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    _instance_handle = _acquire_single_instance()
-    if _instance_handle is None:
-        sys.exit(0)
-    _show_event = _create_show_event()
-    _is_startup = "--startup" in sys.argv
-    app = KefApp(show_event=_show_event, is_startup=_is_startup)
+def main(argv):
+    logging_setup.setup()
+
+    # Installing, updating, uninstalling: before the single-instance lock,
+    # since the installed copy may be running.
+    if setup_flow.handles(argv):
+        return setup_flow.run(argv)
+    if setup_flow.should_offer(argv):
+        outcome = setup_flow.offer(argv)
+        if outcome is not None:
+            return outcome
+
+    instance_handle = _acquire_single_instance()  # noqa: F841 - kept alive
+    if instance_handle is None:
+        return 0
+    is_startup = installer.STARTUP_ARGUMENT in argv
+    log.info("Lancement%s depuis %s", " au démarrage de Windows" if is_startup else "",
+             sys.executable)
+    app = KefApp(show_event=_create_event(_SINGLE_INSTANCE_EVENT),
+                 quit_event=_create_event(installer.QUIT_EVENT_NAME),
+                 is_startup=is_startup)
     app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
